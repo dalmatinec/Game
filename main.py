@@ -1,7 +1,7 @@
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import random
-import psycopg2
+import sqlite3
 from config import BOT_TOKEN, ADMIN_ID, CHAT_ID, DATABASE_URL
 
 # Инициализация бота
@@ -10,29 +10,48 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # Состояние игры
 game_state = {
     "active_game": None,  # "bingo" или "roulette"
-    "players": [],  # Список записей: [{"user_id": user_id, "username": username, "numbers": numbers}, ...]
+    "players": [],  # Список записей: {"user_id": user_id, "username": username, "numbers": numbers}
     "bingo_numbers": [],  # Выбранные числа для Бинго
     "registration_open": False,
     "pinned_message_id": None,
-    "vip_users": [],  # Список словарей: [{"user_id": user_id, "username": username}, ...]
-    "bonus_users": {}  # {user_id: количество_доп_записей} для не-VIP пользователей
+    "vip_users": [],  # Список словарей: {"user_id": user_id, "username": username}
+    "bonus_users": {}  # {user_id: количество_доп_записей}
 }
 
-# Подключение к базе данных
+# Подключение к базе данных SQLite
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    return sqlite3.connect(DATABASE_URL)
 
 # Загрузка данных из базы при старте
 def load_data():
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        cur.execute("CREATE TABLE IF NOT EXISTS vip_users (user_id BIGINT PRIMARY KEY, username TEXT)")
-        cur.execute("CREATE TABLE IF NOT EXISTS bonus_users (user_id BIGINT PRIMARY KEY, bonus_count INTEGER)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS vip_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bonus_users (
+                user_id INTEGER PRIMARY KEY,
+                bonus_count INTEGER
+            )
+        """)
+        # Загружаем VIP-пользователей
         cur.execute("SELECT user_id, username FROM vip_users")
-        game_state["vip_users"] = [{"user_id": row[0], "username": row[1]} for row in cur.fetchall()]
+        game_state["vip_users"] = []
+        rows = cur.fetchall()
+        for row in rows:
+            game_state["vip_users"].append({"user_id": row[0], "username": row[1]})
+        # Загружаем бонусных пользователей
         cur.execute("SELECT user_id, bonus_count FROM bonus_users")
-        game_state["bonus_users"] = {row[0]: row[1] for row in cur.fetchall()}
+        game_state["bonus_users"] = {}
+        rows = cur.fetchall()
+        for row in rows:
+            game_state["bonus_users"][row[0]] = row[1]
+        conn.commit()
     except Exception as e:
         print(f"Ошибка загрузки данных: {e}")
     finally:
@@ -46,12 +65,12 @@ def save_data():
     try:
         cur.execute("DELETE FROM vip_users")
         for vip in game_state["vip_users"]:
-            cur.execute("INSERT INTO vip_users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username",
-                       (vip["user_id"], vip["username"]))
+            cur.execute("INSERT OR REPLACE INTO vip_users (user_id, username) VALUES (?, ?)",
+                        (vip["user_id"], vip["username"]))
         cur.execute("DELETE FROM bonus_users")
         for user_id, count in game_state["bonus_users"].items():
-            cur.execute("INSERT INTO bonus_users (user_id, bonus_count) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET bonus_count = EXCLUDED.bonus_count",
-                       (user_id, count))
+            cur.execute("INSERT OR REPLACE INTO bonus_users (user_id, bonus_count) VALUES (?, ?)",
+                        (user_id, count))
         conn.commit()
     except Exception as e:
         print(f"Ошибка сохранения данных: {e}")
@@ -71,11 +90,18 @@ def is_valid_chat(chat_id):
 
 # Проверка, является ли пользователь VIP
 def is_vip(user_id):
-    return any(vip["user_id"] == user_id for vip in game_state["vip_users"])
+    for vip in game_state["vip_users"]:
+        if vip["user_id"] == user_id:
+            return True
+    return False
 
 # Подсчёт количества записей пользователя
 def count_entries(user_id):
-    return sum(1 for entry in game_state["players"] if entry["user_id"] == user_id)
+    count = 0
+    for entry in game_state["players"]:
+        if entry["user_id"] == user_id:
+            count += 1
+    return count
 
 # Создание инлайн-клавиатуры для выбора игры
 def game_selection_keyboard():
@@ -84,26 +110,32 @@ def game_selection_keyboard():
     keyboard.add(InlineKeyboardButton("🎰 Рулетка", callback_data="roulette"))
     return keyboard
 
+# Создание инлайн-клавиатуры для записи
+def register_button():
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("📝 Записаться", callback_data="register"))
+    return keyboard
+
 # Обновление закреплённого сообщения
 def update_pinned_message(chat_id):
+    message_text = "📋 Список игроков:\n\n"
     if game_state["players"]:
-        message_text = "📋 Список игроков:\n\n"
         for idx, entry in enumerate(game_state["players"], 1):
             if game_state["active_game"] == "bingo":
                 numbers = " ".join(map(str, entry["numbers"]))
                 message_text += f"{idx}. {entry['username']} {numbers}\n"
             else:
                 message_text += f"{idx}. {entry['username']}\n"
-    else:
-        message_text = "📋 Список игроков:\n\n"
+
+    keyboard = register_button() if game_state["active_game"] == "roulette" and game_state["registration_open"] else None
 
     if game_state["pinned_message_id"]:
         try:
-            bot.edit_message_text(message_text, chat_id, game_state["pinned_message_id"])
+            bot.edit_message_text(message_text, chat_id, game_state["pinned_message_id"], reply_markup=keyboard)
         except:
             pass
     else:
-        msg = bot.send_message(chat_id, message_text)
+        msg = bot.send_message(chat_id, message_text, reply_markup=keyboard)
         try:
             bot.pin_chat_message(chat_id, msg.message_id)
             game_state["pinned_message_id"] = msg.message_id
@@ -130,12 +162,35 @@ def start_game(message):
         return
     bot.reply_to(message, "🎮 Выберите игру:", reply_markup=game_selection_keyboard())
 
-# Обработка выбора игры
+# Обработка выбора игры и регистрации
 @bot.callback_query_handler(func=lambda call: True)
 def handle_game_selection(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
     print(f"Callback от user_id={user_id}, chat_id={chat_id}: {call.data}")
+
+    # Обработка кнопки "Записаться"
+    if call.data == "register":
+        if not is_valid_chat(chat_id):
+            bot.answer_callback_query(call.id, "❌ Этот бот работает только в указанном чате!")
+            return
+        if game_state["active_game"] != "roulette" or not game_state["registration_open"]:
+            bot.answer_callback_query(call.id, "❌ Регистрация на рулетку не открыта!")
+            return
+        
+        username = f"@{call.from_user.username or call.from_user.first_name}"
+        current_entries = count_entries(user_id)
+        max_entries = 2 if is_vip(user_id) else (1 + game_state["bonus_users"].get(user_id, 0))
+        if current_entries >= max_entries:
+            bot.answer_callback_query(call.id, f"❌ Вы уже записаны максимальное количество раз ({max_entries})!")
+            return
+        
+        game_state["players"].append({"user_id": user_id, "username": username})
+        update_pinned_message(chat_id)
+        bot.answer_callback_query(call.id, "✅ Вы записаны!")
+        return
+
+    # Обработка выбора игры (только для админов)
     if not is_admin(user_id):
         bot.answer_callback_query(call.id, "❌ Только админ может выбирать игру!")
         return
@@ -148,13 +203,13 @@ def handle_game_selection(call):
 
     if call.data == "bingo":
         bot.send_message(chat_id, 
-            "🎲 Запись на Бинго открыта!\n📝 Для участия отправьте @ и 5 чисел от 1 до 100 (или 4 для VIP/бонус)\nПример: @ 1 2 3 4 5\n\n📋 Список игроков:")
+                        "🎲 Запись на Бинго открыта!\n📝 Для участия отправьте @ и 5 чисел от 1 до 100 (или 4 для VIP/бонус)\nПример: @ 1 2 3 4 5\n\n📋 Список игроков:")
         update_pinned_message(chat_id)
     elif call.data == "roulette":
         bot.send_message(chat_id, 
-            "🎰 Запись на Рулетку открыта!\n📝 Для участия просто отправьте @\n\n📋 Список игроков:")
+                        "🎰 Запись на Рулетку открыта!\n📝 Для участия отправьте @\n\n📋 Список игроков:")
         update_pinned_message(chat_id)
-    
+
     bot.answer_callback_query(call.id)
 
 # Регистрация игроков
@@ -169,7 +224,6 @@ def register_player(message):
     if not is_valid_chat(chat_id):
         return
 
-    # Проверяем, сколько раз пользователь уже записан
     current_entries = count_entries(user_id)
     max_entries = 2 if is_vip(user_id) else (1 + game_state["bonus_users"].get(user_id, 0))
 
@@ -182,22 +236,23 @@ def register_player(message):
         if parts[0] != "@":
             return
         
-        # Проверяем количество чисел (4 для VIP/бонус, 5 для остальных)
         required_numbers = 4 if (is_vip(user_id) or user_id in game_state["bonus_users"]) else 5
         if len(parts) != required_numbers + 1:
             bot.reply_to(message, f"❌ Ожидается {required_numbers} чисел! Пример: @ 1 2 3 4{' 5' if required_numbers == 5 else ''}")
             return
 
         try:
-            numbers = [int(x) for x in parts[1:]]
-            if any(x < 1 or x > 100 for x in numbers):
-                bot.reply_to(message, "❌ Числа должны быть от 1 до 100!")
-                return
+            numbers = []
+            for x in parts[1:]:
+                numbers.append(int(x))
+            for x in numbers:
+                if x < 1 or x > 100:
+                    bot.reply_to(message, "❌ Числа должны быть от 1 до 100!")
+                    return
         except ValueError:
             bot.reply_to(message, "❌ Все числа должны быть целыми!")
             return
 
-        # Добавляем запись
         game_state["players"].append({"user_id": user_id, "username": username, "numbers": numbers})
         update_pinned_message(chat_id)
 
@@ -205,7 +260,6 @@ def register_player(message):
         if message.text.strip() != "@":
             return
         
-        # Добавляем запись
         game_state["players"].append({"user_id": user_id, "username": username})
         update_pinned_message(chat_id)
 
@@ -224,8 +278,8 @@ def stop_registration(message):
         bot.reply_to(message, "⚠ Сбор игроков уже завершён или не начат!")
         return
     game_state["registration_open"] = False
-    bot.send_message(chat_id, 
-        f"⏹ Сбор игроков завершён!\n🎮 Игра {game_state['active_game'].title()} начинается! Всем удачи! 🍀")
+    bot.send_message(chat_id, f"⏹ Сбор игроков завершён!\n🎮 Игра {game_state['active_game'].title()} начинается! Всем удачи! 🍀")
+    update_pinned_message(chat_id)  # Убираем кнопку "Записаться"
 
 # Команды /num и /num2
 @bot.message_handler(commands=['num', 'num2'])
@@ -246,6 +300,7 @@ def generate_bingo_numbers(message):
     for _ in range(count):
         row = random.sample(range(1, 101), 5)
         new_rows.append(row)
+    for row in new_rows:
         game_state["bingo_numbers"].append(row)
     message_text = ""
     for row in game_state["bingo_numbers"]:
@@ -264,22 +319,29 @@ def check_bingo(message):
     if not is_valid_chat(chat_id):
         return
 
-    # Проверяем все записи пользователя
-    user_entries = [entry for entry in game_state["players"] if entry["user_id"] == user_id]
+    user_entries = []
+    for entry in game_state["players"]:
+        if entry["user_id"] == user_id:
+            user_entries.append(entry)
     if not user_entries:
         bot.reply_to(message, "❌ Вы не участвуете в игре!")
         return
 
-    bingo_numbers = set().union(*game_state["bingo_numbers"])
+    bingo_numbers = set()
+    for row in game_state["bingo_numbers"]:
+        for num in row:
+            bingo_numbers.add(num)
     for entry in user_entries:
-        player_numbers = set(entry["numbers"])
+        player_numbers = set()
+        for num in entry["numbers"]:
+            player_numbers.add(num)
         if player_numbers.issubset(bingo_numbers):
             bot.send_message(chat_id, 
-                f"✅ {username} заявил Бинго! Числа совпадают! Админ, проверьте остальные условия. 🎉")
+                            f"✅ {username} заявил Бинго! Числа совпадают! Админ, проверьте остальные условия. 🎉")
             return
 
     bot.send_message(chat_id, 
-        f"❌ {username}, не обманывайте! Не все ваши числа есть в списке. Админ, продолжайте игру! 😡")
+                    f"❌ {username}, не обманывайте! Не все ваши числа есть в списке. Админ, продолжайте игру! 😡")
 
 # Команда /random
 @bot.message_handler(commands=['random'])
@@ -305,9 +367,7 @@ def random_roulette(message):
         bot.reply_to(message, "❌ Укажите число игроков, например /random 30")
         return
     random_index = random.randint(1, count)
-    player = game_state["players"][random_index - 1]
-    bot.send_message(chat_id, 
-        f"🎰 Рандом: {random_index}\nИгрок под номером {random_index}: {player['username']}\n⏳ Ждём 1 минуту...")
+    bot.send_message(chat_id, f"🎰 Рандом: {random_index}\n⏳ Ждём 1 минуту...")
 
 # Команда /stop
 @bot.message_handler(commands=['stop'])
@@ -330,7 +390,7 @@ def stop_game(message):
     game_state["players"] = []
     game_state["bingo_numbers"] = []
     game_state["pinned_message_id"] = None
-    game_state["bonus_users"] = {}  # Авто-сброс бонусов после окончания игры
+    game_state["bonus_users"] = {}
 
 # Команда /reset
 @bot.message_handler(commands=['reset'])
@@ -358,11 +418,10 @@ def get_id(message):
     chat_id = message.chat.id
     username = f"@{message.from_user.username or message.from_user.first_name}"
     print(f"Команда /getid от user_id={user_id}, chat_id={chat_id}")
-    bot.reply_to(message, 
-        f"📋 Информация:\n"
-        f"- Ваш ID: {user_id}\n"
-        f"- ID чата: {chat_id}\n"
-        f"- Ваше имя: {username}")
+    bot.reply_to(message, f"📋 Информация:\n"
+                          f"- Ваш ID: {user_id}\n"
+                          f"- ID чата: {chat_id}\n"
+                          f"- Ваше имя: {username}")
 
 # Команда /vip
 @bot.message_handler(commands=['vip'])
@@ -382,9 +441,10 @@ def set_vip(message):
 
     target_user_id = message.reply_to_message.from_user.id
     target_username = f"@{message.reply_to_message.from_user.username or message.reply_to_message.from_user.first_name}"
-    if any(vip["user_id"] == target_user_id for vip in game_state["vip_users"]):
-        bot.reply_to(message, f"❌ {target_username} уже является VIP!")
-        return
+    for vip in game_state["vip_users"]:
+        if vip["user_id"] == target_user_id:
+            bot.reply_to(message, f"❌ {target_username} уже является VIP!")
+            return
 
     game_state["vip_users"].append({"user_id": target_user_id, "username": target_username})
     save_data()
@@ -408,11 +468,20 @@ def remove_vip(message):
 
     target_user_id = message.reply_to_message.from_user.id
     target_username = f"@{message.reply_to_message.from_user.username or message.reply_to_message.from_user.first_name}"
-    if not any(vip["user_id"] == target_user_id for vip in game_state["vip_users"]):
+    found = False
+    for vip in game_state["vip_users"]:
+        if vip["user_id"] == target_user_id:
+            found = True
+            break
+    if not found:
         bot.reply_to(message, f"❌ {target_username} не является VIP!")
         return
 
-    game_state["vip_users"] = [vip for vip in game_state["vip_users"] if vip["user_id"] != target_user_id]
+    new_vip_users = []
+    for vip in game_state["vip_users"]:
+        if vip["user_id"] != target_user_id:
+            new_vip_users.append(vip)
+    game_state["vip_users"] = new_vip_users
     save_data()
     bot.reply_to(message, f"✅ {target_username} больше не VIP.")
 
@@ -441,9 +510,9 @@ def set_bonus(message):
         bot.reply_to(message, f"❌ {target_username} уже получил бонус в этой игре!")
         return
 
-    game_state["bonus_users"][target_user_id] = 1  # Даём 1 дополнительную запись
+    game_state["bonus_users"][target_user_id] = 1
     save_data()
-    bot.reply_to(message, f"🎁 {target_username} получил бонус на эту игру! Может записываться на бинго с 4 цифрами и на рулетку 2 раза.")
+    bot.reply_to(message, f"🎁 {target_username} получил бонус на эту игру! Может быть записан на бинго с 4 цифрами и на рулетку 2 раза.")
 
 # Команда /top
 @bot.message_handler(commands=['top'])
@@ -455,13 +524,12 @@ def show_top(message):
         return
 
     if not game_state["vip_users"]:
-        bot.send_message(chat_id, "👑 Топ VIP-участников:\n\nСписок пуст! 😔")
+        bot.send_message(chat_id, "👑 Топ VIP-участников:\n\nСписок пустой! 😔")
         return
 
     message_text = "👑 Топ VIP-участников:\n\n"
     for idx, vip in enumerate(game_state["vip_users"], 1):
-        message_text += f"{idx}. {vip['username']} 🏆\n"
-
+        message_text += f"{idx}. {vip['username']}\n"
     bot.send_message(chat_id, message_text)
 
 # Команда /help
@@ -470,29 +538,29 @@ def help_command(message):
     chat_id = message.chat.id
     print(f"Команда /help от user_id={message.from_user.id}, chat_id={chat_id}")
     help_text = (
-        "📖 *Список команд бота:*\n\n"
+        "📖 Список команд бота:\n\n"
         "🎮 /game — Запустить новую игру (Бинго или Рулетка).\n"
-        "📋 /spisok — Завершить сбор игроков и начать игру.\n"
+        "📋 /sp		 — Завершить сбор игроков и начать игру.\n"
         "🔢 /num — Выдать 1 ряд из 5 случайных чисел (для Бинго).\n"
         "🔢 /num2 — Выдать 2 ряда из 5 случайных чисел (для Бинго).\n"
         "🎲 bingo или бинго — Сообщить, что у вас есть все числа (для Бинго).\n"
-        "🎰 /random <число> — Выбрать случайного игрока (для Рулетки, например /random 30).\n"
+        "🎰 /random <число> — Выбрать случайный номер (для Рулетки, например /random 30).\n"
         "🏁 /stop — Завершить текущую игру (Бинго или Рулетка). Бонусы сбрасываются.\n"
         "🔄 /reset — Принудительно сбросить состояние игры.\n"
         "📋 /getid — Показать ваш ID и ID чата.\n"
-        "👑 /vip — Назначить участника VIP (для админов, с реплаем).\n"
-        "👑 /delvip — Удалить участника из VIP (для админов, с реплаем).\n"
-        "🎁 /bonus — Дать бонус участнику (для админов, с реплаем). Сбрасывается после /stop.\n"
+        "👑 /vip — Назначить участника VIP (для админов).\n"
+        "👑 /delvip — Удалить участника из VIP (для админов).\n"
+        "🎁 /bonus — Дать бонус участнику (для админов). Сбрасывается после /stop.\n"
         "🏆 /top — Показать постоянный список VIP-участников.\n"
         "📖 /help — Показать это сообщение.\n\n"
-        "❗ *Примечания:*\n"
+        "❗ Примечания:\n"
         "- Для участия в Бинго отправьте @ и 5 чисел (или 4 для VIP/бонус) (например, @ 1 2 3 4 5).\n"
-        "- Для участия в Рулетке отправьте @ (VIP и бонусные могут 2 раза).\n"
+        "- Для участия в Рулетке отправьте @ или нажмите кнопку 'Записаться' в закреплённом сообщении.\n"
         "- Команды /game, /spisok, /num, /num2, /random, /stop, /reset, /vip, /delvip, /bonus доступны только админу."
     )
-    bot.send_message(chat_id, help_text, parse_mode="Markdown")
+    bot.send_message(chat_id, help_text)
 
-# Сохранение данных перед остановкой
+# Сохранение данных перед завершением
 import atexit
 atexit.register(save_data)
 
