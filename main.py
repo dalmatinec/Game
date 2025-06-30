@@ -503,4 +503,88 @@ def remove_vip(message):
 
 # Команда /bonus
 @bot.message_handler(commands=['bonus'])
-def set_bonus(mes
+def set_bonus(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    print(f"Команда /bonus от user_id={user_id}, chat_id={chat_id}")
+    if not is_admin(user_id):
+        bot.reply_to(message, "❌ Только админ может выдавать бонусы!")
+        return
+    if not is_valid_chat(chat_id):
+        bot.reply_to(message, "❌ Этот бот работает только в указанном чате!")
+        return
+    if not message.reply_to_message:
+        bot.reply_to(message, "❌ Ответьте на сообщение пользователя, которому хотите дать бонус!")
+        return
+
+    target_user_id = message.reply_to_message.from_user.id
+    target_username = f"@{message.reply_to_message.from_user.username or message.reply_to_message.from_user.first_name}"
+    if is_vip(target_user_id):
+        bot.reply_to(message, f"❌ {target_username} является VIP и уже имеет эти привилегии!")
+        return
+    if target_user_id in game_state["bonus_users"]:
+        bot.reply_to(message, f"❌ {target_username} уже получил бонус в этой игре!")
+        return
+
+    game_state["bonus_users"][target_user_id] = 1
+    save_data()
+    bot.reply_to(message, f"🎁 {target_username} получил бонус на эту игру! Может быть записан на бинго с 4 цифрами и на рулетку 2 раза.")
+
+# Команда /top
+@bot.message_handler(commands=['top'])
+def show_top(message):
+    chat_id = message.chat.id
+    print(f"Команда /top от user_id={message.from_user.id}, chat_id={chat_id}")
+    if not is_valid_chat(chat_id):
+        bot.reply_to(message, "❌ Этот бот работает только в указанном чате!")
+        return
+
+    if not game_state["vip_users"]:
+        bot.send_message(chat_id, "👑 Топ VIP-участников:\n\nСписок пустой!")
+        return
+
+    message_text = "👑 Топ VIP-участников:\n\n"
+    for idx, vip in enumerate(game_state["vip_users"], 1):
+        message_text += f"{idx}. {vip['username']}\n"
+    bot.send_message(chat_id, message_text)
+
+# Команда /help
+@bot.message_handler(commands=['help'])
+def help_command(message):
+    chat_id = message.chat.id
+    print(f"Команда /help от user_id={message.from_user.id}, chat_id={chat_id}")
+    help_text = (
+        "📖 Список команд бота:\n\n"
+        "🎮 /game — Запустить новую игру (Бинго или Рулетка).\n"
+        "📋 /spisok — Завершить сбор игроков и начать игру.\n"
+        "🔢 /num — Выдать 1 ряд из 5 случайных чисел (для Бинго).\n"
+        "🔢 /num2 — Выдать 2 ряда из 5 случайных чисел (для Бинго).\n"
+        "🔗 /bingo — Сообщить, что у вас есть все числа (для Бинго).\n"
+        "🎰 /random <число> — Выбрать случайный номер (для Рулетки, например /random 30).\n"
+        "🏁 /stop — Завершить игру (Бинго или Рулетка). Бонусы сбрасываются.\n"
+        "🔄 /reset — Принудительно сбросить состояние игры.\n"
+        "📋 /getid — Показать ваш ID и ID чата.\n"
+        "👑 /vip — Назначить участника VIP (для админов).\n"
+        "👑 /delvip — Удалить участника из VIP (для админов).\n"
+        "🎁 /bonus — Дать бонус участнику (для админов).\n"
+        "🏆 /top — Показать список VIP-участников.\n"
+        "📖 /help — Показать это сообщение.\n\n"
+        "❗ Примечания:\n"
+        "- Для участия в Бинге отправьте @ и 5 чисел (или 4 для VIP/бонуса) (например, @ 1 2 3 4 5).\n"
+        "- Для участия в Рулетке отправьте @ или нажмите кнопку 'Записаться' в закреплённом сообщении.\n"
+        "- Команды /game, /spisok, /num, /num2, /random, /stop, /reset, /vip, /delvip, /bonus доступны только админу."
+    )
+    bot.send_message(chat_id, help_text)
+
+# Сохранение данных перед завершением
+import atexit
+atexit.register(save_data)
+
+# Запуск бота
+if __name__ == "__main__":
+    print("Бот запущен...")
+    try:
+        bot.infinity_polling()
+    except Exception as e:
+        print(f"Ошибка в polling: {e}")
+        save_data()
